@@ -18,9 +18,10 @@
     }
     .stage { position: relative; flex: 1; min-height: 0; overflow: hidden; border-radius: 0.5rem; background: #111; }
     video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
-    video { object-fit: cover; object-position: center; }
+    video { opacity: 0; pointer-events: none; }
     canvas { pointer-events: none; }
     output { display: block; min-height: 3.5rem; padding: 0.75rem; border: 1px solid #888; border-radius: 0.5rem; white-space: pre-wrap; word-break: break-all; }
+    .actions { display: flex; flex-direction: column; gap: 0.5rem; }
     button { font: inherit; padding: 0.9rem; }
     p { margin: 0; color: #666; }
   </style>
@@ -33,17 +34,23 @@
     </div>
     <output id="result">読み取った内容</output>
     <p id="note"></p>
-    <button id="toggle" type="button">読み取り開始</button>
+    <div class="actions">
+      <button id="engine" type="button">検出: zxing-wasm</button>
+      <button id="toggle" type="button">読み取り開始</button>
+    </div>
   </main>
   <script type="module">
     import { prepareZXingModule, readBarcodes } from 'https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.6/dist/es/reader/index.js';
 
     const labels = { QRCode: 'QR', EAN13: 'EAN-13', EAN8: 'EAN-8', UPCA: 'UPC-A', UPCE: 'UPC-E', Code128: 'Code 128', Code39: 'Code 39', ITF: 'ITF', Codabar: 'Codabar' };
+    const nativeLabels = { qr_code: 'QR', ean_13: 'EAN-13', ean_8: 'EAN-8', upc_a: 'UPC-A', upc_e: 'UPC-E', code_128: 'Code 128', code_39: 'Code 39', itf: 'ITF', codabar: 'Codabar' };
+    const nativeFormats = Object.keys(nativeLabels);
     const view = document.querySelector('#view');
     const overlay = document.querySelector('#overlay');
     const result = document.querySelector('#result');
     const note = document.querySelector('#note');
     const toggle = document.querySelector('#toggle');
+    const engineButton = document.querySelector('#engine');
     const context = overlay.getContext('2d');
     const capture = document.createElement('canvas');
     const captureContext = capture.getContext('2d', { willReadFrequently: true });
@@ -61,36 +68,88 @@
     let session = 0;
     let hits = null;
     let scale = 1;
+    let engine = 'wasm';
+    let detectorPromise = null;
     const wasmReady = prepareZXingModule({ fireImmediately: true });
+
+    function labelEngine() {
+      engineButton.textContent = engine === 'native' ? '検出: BarcodeDetector' : '検出: zxing-wasm';
+    }
+
+    function ensureDetector() {
+      if (detectorPromise) return detectorPromise;
+      detectorPromise = (async () => {
+        if (!('BarcodeDetector' in window)) return null;
+        const supported = await BarcodeDetector.getSupportedFormats();
+        const formats = nativeFormats.filter((format) => supported.includes(format));
+        if (!formats.length) return null;
+        return new BarcodeDetector({ formats });
+      })();
+      return detectorPromise.then((detector) => {
+        if (!detector) detectorPromise = null;
+        return detector;
+      }, (error) => {
+        detectorPromise = null;
+        throw error;
+      });
+    }
+
+    function nativePoints(code) {
+      const points = code.cornerPoints?.length >= 4 ? code.cornerPoints : [
+        { x: code.boundingBox.x, y: code.boundingBox.y },
+        { x: code.boundingBox.x + code.boundingBox.width, y: code.boundingBox.y },
+        { x: code.boundingBox.x + code.boundingBox.width, y: code.boundingBox.y + code.boundingBox.height },
+        { x: code.boundingBox.x, y: code.boundingBox.y + code.boundingBox.height },
+      ];
+      return [...points].slice(0, 4).map((point) => ({ x: point.x, y: point.y }));
+    }
 
     function nextFrame() {
       return new Promise((resolve) => requestAnimationFrame(() => resolve()));
     }
 
-    function screenPoints() {
+    function framePlacement() {
       const box = overlay.getBoundingClientRect();
-      const sourceWidth = view.videoWidth || box.width;
-      const sourceHeight = view.videoHeight || box.height;
+      const sourceWidth = view.videoWidth;
+      const sourceHeight = view.videoHeight;
+      if (!sourceWidth || !sourceHeight || !box.width || !box.height) {
+        return { box, ready: false };
+      }
       const cover = Math.max(box.width / sourceWidth, box.height / sourceHeight);
-      const left = (box.width - sourceWidth * cover) / 2;
-      const top = (box.height - sourceHeight * cover) / 2;
+      const width = sourceWidth * cover;
+      const height = sourceHeight * cover;
+      return {
+        box,
+        ready: true,
+        left: (box.width - width) / 2,
+        top: (box.height - height) / 2,
+        width,
+        height,
+        cover,
+      };
+    }
+
+    function screenPoints(place) {
       return hits.map((point) => [
-        left + point.x * cover,
-        top + point.y * cover,
+        place.left + point.x * place.cover,
+        place.top + point.y * place.cover,
       ]);
     }
 
     function paint() {
-      const box = overlay.getBoundingClientRect();
+      const place = framePlacement();
+      const box = place.box;
       const ratio = window.devicePixelRatio || 1;
-      const nextWidth = Math.round(box.width * ratio);
-      const nextHeight = Math.round(box.height * ratio);
+      const nextWidth = Math.max(1, Math.round(box.width * ratio));
+      const nextHeight = Math.max(1, Math.round(box.height * ratio));
       if (overlay.width !== nextWidth || overlay.height !== nextHeight) {
         overlay.width = nextWidth;
         overlay.height = nextHeight;
       }
       context.setTransform(ratio, 0, 0, ratio, 0, 0);
-      context.clearRect(0, 0, box.width, box.height);
+      context.fillStyle = '#111';
+      context.fillRect(0, 0, box.width, box.height);
+      if (place.ready) context.drawImage(view, place.left, place.top, place.width, place.height);
       const margin = Math.min(box.width, box.height) * 0.12;
       const length = margin * 0.7;
       context.strokeStyle = 'rgba(255,255,255,0.85)';
@@ -107,8 +166,8 @@
         context.lineTo(x + dx * length, y);
         context.stroke();
       }
-      if (!hits?.length) return;
-      const points = screenPoints();
+      if (!hits?.length || !place.ready) return;
+      const points = screenPoints(place);
       context.beginPath();
       points.forEach(([x, y], index) => (index ? context.lineTo(x, y) : context.moveTo(x, y)));
       context.closePath();
@@ -152,6 +211,28 @@
       toggle.textContent = '読み取り開始';
     }
 
+    async function readFrame(mode) {
+      if (mode === 'native') {
+        const reader = await ensureDetector();
+        if (!reader) {
+          engine = 'wasm';
+          labelEngine();
+          note.textContent = 'このブラウザは BarcodeDetector に対応していません。';
+          return null;
+        }
+        const codes = await reader.detect(view);
+        const code = codes.find((item) => item.rawValue);
+        if (!code) return null;
+        const name = nativeLabels[code.format] ?? code.format;
+        return { points: nativePoints(code), line: `${name}\n${code.rawValue}` };
+      }
+      const found = await readBarcodes(grab(), readerOptions);
+      const hit = found.find((item) => item.isValid && item.text);
+      if (!hit) return null;
+      const name = labels[hit.format] ?? hit.format;
+      return { points: videoPoints(hit.position), line: `${name}\n${hit.text}` };
+    }
+
     async function loop(token) {
       let misses = 0;
       while (running && token === session) {
@@ -159,34 +240,61 @@
           await nextFrame();
           continue;
         }
-        const image = grab();
-        let found = [];
+        const mode = engine;
+        let hit = null;
         try {
-          found = await readBarcodes(image, readerOptions);
+          hit = await readFrame(mode);
         } catch (error) {
           if (token !== session) return;
           note.textContent = '読み取りに失敗しました。';
           await nextFrame();
           continue;
         }
-        if (token !== session) return;
-        const hit = found.find((item) => item.isValid && item.text);
+        if (token !== session || engine !== mode) continue;
         if (hit) {
           misses = 0;
-          hits = videoPoints(hit.position);
-          const name = labels[hit.format] ?? hit.format;
-          const line = `${name}\n${hit.text}`;
-          if (result.textContent !== line) result.textContent = line;
+          hits = hit.points;
+          if (result.textContent !== hit.line) result.textContent = hit.line;
         } else if (++misses >= 3) {
           hits = null;
         }
-        paint();
         await nextFrame();
       }
     }
 
+    function preview() {
+      if (!running) return;
+      paint();
+      requestAnimationFrame(preview);
+    }
+
     new ResizeObserver(() => paint()).observe(overlay);
     paint();
+
+    engineButton.addEventListener('click', async () => {
+      if (engine === 'wasm') {
+        engineButton.disabled = true;
+        try {
+          const reader = await ensureDetector();
+          if (!reader) {
+            note.textContent = 'このブラウザは BarcodeDetector に対応していません。';
+            return;
+          }
+        } catch (error) {
+          note.textContent = 'BarcodeDetector を開始できませんでした。';
+          return;
+        } finally {
+          engineButton.disabled = false;
+        }
+        engine = 'native';
+      } else {
+        engine = 'wasm';
+      }
+      hits = null;
+      note.textContent = '';
+      labelEngine();
+      if (running) paint();
+    });
 
     toggle.addEventListener('click', async () => {
       if (running) {
@@ -221,7 +329,7 @@
         running = true;
         toggle.disabled = false;
         toggle.textContent = '停止';
-        paint();
+        requestAnimationFrame(preview);
         loop(token);
       } catch (error) {
         if (token !== session) return;
