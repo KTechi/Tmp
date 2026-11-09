@@ -16,10 +16,10 @@
       padding: 0.75rem;
       padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
     }
-    .stage { position: relative; flex: 1; min-height: 12rem; }
-    video, canvas { width: 100%; height: 100%; border-radius: 0.5rem; }
-    video { display: block; background: #111; object-fit: cover; }
-    canvas { position: absolute; inset: 0; pointer-events: none; }
+    .stage { position: relative; flex: 1; min-height: 0; overflow: hidden; border-radius: 0.5rem; background: #111; }
+    video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+    video { object-fit: cover; object-position: center; }
+    canvas { pointer-events: none; }
     output { display: block; min-height: 3.5rem; padding: 0.75rem; border: 1px solid #888; border-radius: 0.5rem; white-space: pre-wrap; word-break: break-all; }
     button { font: inherit; padding: 0.9rem; }
     p { margin: 0; color: #666; }
@@ -36,50 +36,48 @@
     <button id="toggle" type="button">読み取り開始</button>
   </main>
   <script type="module">
-    import { BrowserMultiFormatReader } from 'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/+esm';
+    import { prepareZXingModule, readBarcodes } from 'https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.6/dist/es/reader/index.js';
 
-    const formats = ['Aztec', 'Codabar', 'Code 39', 'Code 93', 'Code 128', 'Data Matrix', 'EAN-8', 'EAN-13', 'ITF', 'MaxiCode', 'PDF417', 'QR', 'RSS-14', 'RSS Expanded', 'UPC-A', 'UPC-E', 'UPC/EAN'];
+    const labels = { QRCode: 'QR', EAN13: 'EAN-13', EAN8: 'EAN-8', UPCA: 'UPC-A', UPCE: 'UPC-E', Code128: 'Code 128', Code39: 'Code 39', ITF: 'ITF', Codabar: 'Codabar' };
     const view = document.querySelector('#view');
     const overlay = document.querySelector('#overlay');
     const result = document.querySelector('#result');
     const note = document.querySelector('#note');
     const toggle = document.querySelector('#toggle');
-    const reader = new BrowserMultiFormatReader(undefined, {
-      delayBetweenScanAttempts: 80,
-      delayBetweenScanSuccess: 80,
-    });
     const context = overlay.getContext('2d');
-    let controls = null;
+    const capture = document.createElement('canvas');
+    const captureContext = capture.getContext('2d', { willReadFrequently: true });
+    const readerOptions = {
+      formats: ['QRCode', 'EAN13', 'EAN8', 'UPCA', 'UPCE', 'Code128', 'Code39', 'ITF', 'Codabar'],
+      tryHarder: false,
+      tryRotate: false,
+      tryInvert: false,
+      tryDownscale: false,
+      maxNumberOfSymbols: 1,
+    };
+    const decodeLongEdge = 720;
+    let stream = null;
+    let running = false;
+    let session = 0;
     let hits = null;
-    let viewWidth = 0;
-    let viewHeight = 0;
+    let scale = 1;
+    const wasmReady = prepareZXingModule({ fireImmediately: true });
+
+    function nextFrame() {
+      return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+    }
 
     function screenPoints() {
       const box = overlay.getBoundingClientRect();
       const sourceWidth = view.videoWidth || box.width;
       const sourceHeight = view.videoHeight || box.height;
-      const wide = sourceWidth / sourceHeight > box.width / box.height;
-      const drawnWidth = wide ? box.height * (sourceWidth / sourceHeight) : box.width;
-      const drawnHeight = wide ? box.height : box.width * (sourceHeight / sourceWidth);
-      const left = (box.width - drawnWidth) / 2;
-      const top = (box.height - drawnHeight) / 2;
-      const mapped = hits.map((point) => [
-        left + (point.getX() / sourceWidth) * drawnWidth,
-        top + (point.getY() / sourceHeight) * drawnHeight,
+      const cover = Math.max(box.width / sourceWidth, box.height / sourceHeight);
+      const left = (box.width - sourceWidth * cover) / 2;
+      const top = (box.height - sourceHeight * cover) / 2;
+      return hits.map((point) => [
+        left + point.x * cover,
+        top + point.y * cover,
       ]);
-      if (mapped.length !== 2) return mapped;
-      const [a, b] = mapped;
-      const dx = b[0] - a[0];
-      const dy = b[1] - a[1];
-      const length = Math.hypot(dx, dy) || 1;
-      const px = (-dy / length) * 16;
-      const py = (dx / length) * 16;
-      return [
-        [a[0] + px, a[1] + py],
-        [b[0] + px, b[1] + py],
-        [b[0] - px, b[1] - py],
-        [a[0] - px, a[1] - py],
-      ];
     }
 
     function paint() {
@@ -121,50 +119,112 @@
       context.stroke();
     }
 
+    function grab() {
+      const sourceWidth = view.videoWidth;
+      const sourceHeight = view.videoHeight;
+      const edge = Math.max(sourceWidth, sourceHeight);
+      const factor = edge > decodeLongEdge ? decodeLongEdge / edge : 1;
+      const width = Math.max(1, Math.round(sourceWidth * factor));
+      const height = Math.max(1, Math.round(sourceHeight * factor));
+      if (capture.width !== width || capture.height !== height) {
+        capture.width = width;
+        capture.height = height;
+      }
+      scale = width / sourceWidth;
+      captureContext.drawImage(view, 0, 0, width, height);
+      return captureContext.getImageData(0, 0, width, height);
+    }
+
+    function videoPoints(position) {
+      return [position.topLeft, position.topRight, position.bottomRight, position.bottomLeft]
+        .map((point) => ({ x: point.x / scale, y: point.y / scale }));
+    }
+
     function halt() {
-      controls?.stop();
-      controls = null;
+      session += 1;
+      running = false;
+      stream?.getTracks().forEach((track) => track.stop());
+      stream = null;
+      view.srcObject = null;
       hits = null;
-      viewWidth = 0;
       paint();
+      toggle.disabled = false;
       toggle.textContent = '読み取り開始';
     }
 
-    view.addEventListener('resize', () => {
-      if (view.videoWidth !== viewWidth || view.videoHeight !== viewHeight) {
-        viewWidth = view.videoWidth;
-        viewHeight = view.videoHeight;
+    async function loop(token) {
+      let misses = 0;
+      while (running && token === session) {
+        if (view.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !view.videoWidth) {
+          await nextFrame();
+          continue;
+        }
+        const image = grab();
+        let found = [];
+        try {
+          found = await readBarcodes(image, readerOptions);
+        } catch (error) {
+          if (token !== session) return;
+          note.textContent = '読み取りに失敗しました。';
+          await nextFrame();
+          continue;
+        }
+        if (token !== session) return;
+        const hit = found.find((item) => item.isValid && item.text);
+        if (hit) {
+          misses = 0;
+          hits = videoPoints(hit.position);
+          const name = labels[hit.format] ?? hit.format;
+          const line = `${name}\n${hit.text}`;
+          if (result.textContent !== line) result.textContent = line;
+        } else if (++misses >= 3) {
+          hits = null;
+        }
         paint();
+        await nextFrame();
       }
-    });
+    }
+
+    new ResizeObserver(() => paint()).observe(overlay);
+    paint();
 
     toggle.addEventListener('click', async () => {
-      if (controls) {
+      if (running) {
         halt();
         return;
       }
+      const token = ++session;
       note.textContent = '';
       toggle.disabled = true;
       try {
-        controls = await reader.decodeFromConstraints({
+        await wasmReady;
+        if (token !== session) return;
+        const media = await navigator.mediaDevices.getUserMedia({
+          audio: false,
           video: {
             facingMode: { ideal: 'environment' },
             width: { ideal: 1280 },
             height: { ideal: 720 },
           },
-        }, view, (found) => {
-          if (!found) return;
-          hits = found.getResultPoints();
-          const name = formats[found.getBarcodeFormat()] ?? '';
-          const text = found.getText();
-          result.textContent = name ? `${name}\n${text}` : text;
-          paint();
         });
+        if (token !== session) {
+          media.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        stream = media;
+        view.srcObject = media;
+        await view.play();
+        if (token !== session) {
+          halt();
+          return;
+        }
+        running = true;
         toggle.disabled = false;
         toggle.textContent = '停止';
         paint();
+        loop(token);
       } catch (error) {
-        toggle.disabled = false;
+        if (token !== session) return;
         halt();
         note.textContent = error?.name === 'NotAllowedError'
           ? 'カメラの使用が拒否されました。'
