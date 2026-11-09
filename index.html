@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>コード読み取り</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; font: 16px/1.4 system-ui, sans-serif; }
+    main { max-width: 32rem; margin: 0 auto; padding: 1rem; }
+    button { width: 100%; font: inherit; padding: 0.8rem; }
+    .stage { position: relative; margin: 0.75rem 0; }
+    video, canvas { width: 100%; aspect-ratio: 3/4; border-radius: 0.5rem; }
+    video { display: block; background: #111; object-fit: cover; }
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    output { display: block; min-height: 3.5rem; padding: 0.75rem; border: 1px solid #888; border-radius: 0.5rem; white-space: pre-wrap; word-break: break-all; }
+    p { margin: 0.5rem 0 0; color: #666; }
+  </style>
+</head>
+<body>
+  <main>
+    <button id="toggle" type="button">読み取り開始</button>
+    <div class="stage">
+      <video id="view" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <output id="result">読み取った内容</output>
+    <p id="note"></p>
+  </main>
+  <script type="module">
+    import { BrowserMultiFormatReader } from 'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/+esm';
+
+    const formats = ['Aztec', 'Codabar', 'Code 39', 'Code 93', 'Code 128', 'Data Matrix', 'EAN-8', 'EAN-13', 'ITF', 'MaxiCode', 'PDF417', 'QR', 'RSS-14', 'RSS Expanded', 'UPC-A', 'UPC-E', 'UPC/EAN'];
+    const view = document.querySelector('#view');
+    const overlay = document.querySelector('#overlay');
+    const result = document.querySelector('#result');
+    const note = document.querySelector('#note');
+    const toggle = document.querySelector('#toggle');
+    const reader = new BrowserMultiFormatReader();
+    const context = overlay.getContext('2d');
+    let controls = null;
+    let frame = 0;
+    let hits = null;
+
+    function place(point) {
+      const box = overlay.getBoundingClientRect();
+      const sourceWidth = view.videoWidth || box.width;
+      const sourceHeight = view.videoHeight || box.height;
+      const wide = sourceWidth / sourceHeight > box.width / box.height;
+      const drawnWidth = wide ? box.height * (sourceWidth / sourceHeight) : box.width;
+      const drawnHeight = wide ? box.height : box.width * (sourceHeight / sourceWidth);
+      const left = (box.width - drawnWidth) / 2;
+      const top = (box.height - drawnHeight) / 2;
+      return [
+        left + (point.getX() / sourceWidth) * drawnWidth,
+        top + (point.getY() / sourceHeight) * drawnHeight,
+      ];
+    }
+
+    function paint() {
+      const box = overlay.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      overlay.width = Math.round(box.width * ratio);
+      overlay.height = Math.round(box.height * ratio);
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      context.clearRect(0, 0, box.width, box.height);
+      const margin = Math.min(box.width, box.height) * 0.16;
+      const length = margin * 0.55;
+      context.strokeStyle = 'rgba(255,255,255,0.85)';
+      context.lineWidth = 3;
+      for (const [x, y, dx, dy] of [
+        [margin, margin, 1, 1],
+        [box.width - margin, margin, -1, 1],
+        [margin, box.height - margin, 1, -1],
+        [box.width - margin, box.height - margin, -1, -1],
+      ]) {
+        context.beginPath();
+        context.moveTo(x, y + dy * length);
+        context.lineTo(x, y);
+        context.lineTo(x + dx * length, y);
+        context.stroke();
+      }
+      if (!hits) return;
+      const points = hits.map(place);
+      context.beginPath();
+      points.forEach(([x, y], index) => (index ? context.lineTo(x, y) : context.moveTo(x, y)));
+      context.closePath();
+      context.fillStyle = 'rgba(40, 200, 80, 0.35)';
+      context.strokeStyle = '#14c85a';
+      context.lineWidth = 4;
+      context.fill();
+      context.stroke();
+    }
+
+    function loop() {
+      paint();
+      if (controls) frame = requestAnimationFrame(loop);
+    }
+
+    function halt() {
+      controls?.stop();
+      controls = null;
+      cancelAnimationFrame(frame);
+      hits = null;
+      paint();
+      toggle.textContent = '読み取り開始';
+    }
+
+    toggle.addEventListener('click', async () => {
+      if (controls) {
+        halt();
+        return;
+      }
+      note.textContent = '';
+      toggle.disabled = true;
+      try {
+        controls = await reader.decodeFromVideoDevice(undefined, view, (found) => {
+          if (!found) return;
+          hits = found.getResultPoints();
+          const name = formats[found.getBarcodeFormat()] ?? '';
+          const text = found.getText();
+          result.textContent = name ? `${name}\n${text}` : text;
+        });
+        toggle.disabled = false;
+        toggle.textContent = '停止';
+        loop();
+      } catch (error) {
+        toggle.disabled = false;
+        halt();
+        note.textContent = error?.name === 'NotAllowedError'
+          ? 'カメラの使用が拒否されました。'
+          : 'カメラを開始できませんでした。';
+      }
+    });
+  </script>
+</body>
+</html>
