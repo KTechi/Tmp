@@ -7,25 +7,33 @@
   <style>
     :root { color-scheme: light dark; }
     body { margin: 0; font: 16px/1.4 system-ui, sans-serif; }
-    main { max-width: 32rem; margin: 0 auto; padding: 1rem; }
-    button { width: 100%; font: inherit; padding: 0.8rem; }
-    .stage { position: relative; margin: 0.75rem 0; }
-    video, canvas { width: 100%; aspect-ratio: 3/4; border-radius: 0.5rem; }
+    main {
+      box-sizing: border-box;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      padding: 0.75rem;
+      padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
+    }
+    .stage { position: relative; flex: 1; min-height: 12rem; }
+    video, canvas { width: 100%; height: 100%; border-radius: 0.5rem; }
     video { display: block; background: #111; object-fit: cover; }
-    canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    canvas { position: absolute; inset: 0; pointer-events: none; }
     output { display: block; min-height: 3.5rem; padding: 0.75rem; border: 1px solid #888; border-radius: 0.5rem; white-space: pre-wrap; word-break: break-all; }
-    p { margin: 0.5rem 0 0; color: #666; }
+    button { font: inherit; padding: 0.9rem; }
+    p { margin: 0; color: #666; }
   </style>
 </head>
 <body>
   <main>
-    <button id="toggle" type="button">読み取り開始</button>
     <div class="stage">
       <video id="view" playsinline muted></video>
       <canvas id="overlay"></canvas>
     </div>
     <output id="result">読み取った内容</output>
     <p id="note"></p>
+    <button id="toggle" type="button">読み取り開始</button>
   </main>
   <script type="module">
     import { BrowserMultiFormatReader } from 'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/+esm';
@@ -36,13 +44,17 @@
     const result = document.querySelector('#result');
     const note = document.querySelector('#note');
     const toggle = document.querySelector('#toggle');
-    const reader = new BrowserMultiFormatReader();
+    const reader = new BrowserMultiFormatReader(undefined, {
+      delayBetweenScanAttempts: 80,
+      delayBetweenScanSuccess: 80,
+    });
     const context = overlay.getContext('2d');
     let controls = null;
-    let frame = 0;
     let hits = null;
+    let viewWidth = 0;
+    let viewHeight = 0;
 
-    function place(point) {
+    function screenPoints() {
       const box = overlay.getBoundingClientRect();
       const sourceWidth = view.videoWidth || box.width;
       const sourceHeight = view.videoHeight || box.height;
@@ -51,21 +63,38 @@
       const drawnHeight = wide ? box.height : box.width * (sourceHeight / sourceWidth);
       const left = (box.width - drawnWidth) / 2;
       const top = (box.height - drawnHeight) / 2;
-      return [
+      const mapped = hits.map((point) => [
         left + (point.getX() / sourceWidth) * drawnWidth,
         top + (point.getY() / sourceHeight) * drawnHeight,
+      ]);
+      if (mapped.length !== 2) return mapped;
+      const [a, b] = mapped;
+      const dx = b[0] - a[0];
+      const dy = b[1] - a[1];
+      const length = Math.hypot(dx, dy) || 1;
+      const px = (-dy / length) * 16;
+      const py = (dx / length) * 16;
+      return [
+        [a[0] + px, a[1] + py],
+        [b[0] + px, b[1] + py],
+        [b[0] - px, b[1] - py],
+        [a[0] - px, a[1] - py],
       ];
     }
 
     function paint() {
       const box = overlay.getBoundingClientRect();
       const ratio = window.devicePixelRatio || 1;
-      overlay.width = Math.round(box.width * ratio);
-      overlay.height = Math.round(box.height * ratio);
+      const nextWidth = Math.round(box.width * ratio);
+      const nextHeight = Math.round(box.height * ratio);
+      if (overlay.width !== nextWidth || overlay.height !== nextHeight) {
+        overlay.width = nextWidth;
+        overlay.height = nextHeight;
+      }
       context.setTransform(ratio, 0, 0, ratio, 0, 0);
       context.clearRect(0, 0, box.width, box.height);
-      const margin = Math.min(box.width, box.height) * 0.16;
-      const length = margin * 0.55;
+      const margin = Math.min(box.width, box.height) * 0.12;
+      const length = margin * 0.7;
       context.strokeStyle = 'rgba(255,255,255,0.85)';
       context.lineWidth = 3;
       for (const [x, y, dx, dy] of [
@@ -80,8 +109,8 @@
         context.lineTo(x + dx * length, y);
         context.stroke();
       }
-      if (!hits) return;
-      const points = hits.map(place);
+      if (!hits?.length) return;
+      const points = screenPoints();
       context.beginPath();
       points.forEach(([x, y], index) => (index ? context.lineTo(x, y) : context.moveTo(x, y)));
       context.closePath();
@@ -92,19 +121,22 @@
       context.stroke();
     }
 
-    function loop() {
-      paint();
-      if (controls) frame = requestAnimationFrame(loop);
-    }
-
     function halt() {
       controls?.stop();
       controls = null;
-      cancelAnimationFrame(frame);
       hits = null;
+      viewWidth = 0;
       paint();
       toggle.textContent = '読み取り開始';
     }
+
+    view.addEventListener('resize', () => {
+      if (view.videoWidth !== viewWidth || view.videoHeight !== viewHeight) {
+        viewWidth = view.videoWidth;
+        viewHeight = view.videoHeight;
+        paint();
+      }
+    });
 
     toggle.addEventListener('click', async () => {
       if (controls) {
@@ -114,16 +146,23 @@
       note.textContent = '';
       toggle.disabled = true;
       try {
-        controls = await reader.decodeFromVideoDevice(undefined, view, (found) => {
+        controls = await reader.decodeFromConstraints({
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+        }, view, (found) => {
           if (!found) return;
           hits = found.getResultPoints();
           const name = formats[found.getBarcodeFormat()] ?? '';
           const text = found.getText();
           result.textContent = name ? `${name}\n${text}` : text;
+          paint();
         });
         toggle.disabled = false;
         toggle.textContent = '停止';
-        loop();
+        paint();
       } catch (error) {
         toggle.disabled = false;
         halt();
