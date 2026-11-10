@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>動くコード</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #111; }
+    #card {
+      position: absolute;
+      left: 0;
+      top: 0;
+      z-index: 1;
+      padding: 0.35rem;
+      background: #fff;
+    }
+    canvas { display: block; height: auto; image-rendering: pixelated; }
+    canvas.qr { width: min(34vmin, 200px); }
+    canvas.ean { width: min(92vw, 420px); }
+    button { font: inherit; margin: 0 0 0.7rem; padding: 0.7rem 0.9rem; }
+    #panel {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 2;
+      box-sizing: border-box;
+      max-height: 42dvh;
+      overflow: auto;
+      padding: 0.75rem;
+      padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
+      background: #fff;
+      color: #111;
+      font: 15px/1.45 system-ui, sans-serif;
+    }
+    #expect { margin: 0 0 0.7rem; }
+    label { display: flex; align-items: center; gap: 0.7rem; }
+    input[type="range"] { flex: 1; }
+  </style>
+</head>
+<body>
+  <div id="card">
+    <canvas id="code"></canvas>
+  </div>
+  <div id="panel">
+    <p id="expect"></p>
+    <button id="mode" type="button">バーコードに切り替え</button>
+    <label>速さ <input id="speed" type="range" min="1" max="10" value="7"></label>
+  </div>
+  <script type="module">
+    import { encode } from 'https://cdn.jsdelivr.net/npm/uqr@0.1.3/dist/index.mjs';
+
+    const card = document.querySelector('#card');
+    const canvas = document.querySelector('#code');
+    const expect = document.querySelector('#expect');
+    const modeButton = document.querySelector('#mode');
+    const speedInput = document.querySelector('#speed');
+    const context = canvas.getContext('2d');
+    const leftCodes = ['0001101', '0011001', '0010011', '0111101', '0100011', '0110001', '0101111', '0111011', '0110111', '0001011'];
+    const guardCodes = ['0100111', '0110011', '0011011', '0100001', '0011101', '0111001', '0000101', '0010001', '0001001', '0010111'];
+    const rightCodes = leftCodes.map((code) => code.replace(/0/g, '2').replace(/1/g, '0').replace(/2/g, '1'));
+    const parity = ['LLLLLL', 'LLGLGG', 'LLGGLG', 'LLGGGL', 'LGLLGG', 'LGGLLG', 'LGGGLL', 'LGLGLG', 'LGLGGL', 'LGGLGL'];
+    let mode = 'qr';
+    let count = 0;
+    let x = 0;
+    let y = 0;
+    let vx = 0;
+    let vy = 0;
+    let last = 0;
+
+    function payload(number) {
+      const label = String(number).padStart(4, '0');
+      return `読み取り確認。通し番号は${label}です。画面下の文章と、最後の句点まで一字も同じなら成功です。欠けた文字、入れ替わった文字、違う番号は失敗です。このQRは誤り訂正を最低にして、模様を細かくしています。動きの速さは下のつまみで変わります。番号${label}の照合はここまでです。`;
+    }
+
+    function ean13(number) {
+      const body = ('490' + String(number).padStart(9, '0')).slice(-12);
+      let sum = 0;
+      for (let index = 0; index < 12; index += 1) sum += Number(body[index]) * (index % 2 === 0 ? 1 : 3);
+      const digits = body + String((10 - (sum % 10)) % 10);
+      let bars = '101';
+      const pattern = parity[Number(digits[0])];
+      for (let index = 0; index < 6; index += 1) {
+        const table = pattern[index] === 'L' ? leftCodes : guardCodes;
+        bars += table[Number(digits[index + 1])];
+      }
+      bars += '01010';
+      for (let index = 7; index < 13; index += 1) bars += rightCodes[Number(digits[index])];
+      bars += '101';
+      return { digits, bars };
+    }
+
+    function paintModules(columns, rows, dark) {
+      const module = 2;
+      canvas.width = columns * module;
+      canvas.height = rows * module;
+      context.fillStyle = '#fff';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.fillStyle = '#000';
+      for (let row = 0; row < rows; row += 1) {
+        for (let column = 0; column < columns; column += 1) {
+          if (dark(column, row)) context.fillRect(column * module, row * module, module, module);
+        }
+      }
+    }
+
+    function draw() {
+      if (mode === 'ean') {
+        const code = ean13(count);
+        const quiet = 11;
+        canvas.className = 'ean';
+        paintModules(code.bars.length + quiet * 2, 32, (column, row) => row > 1 && row < 30 && code.bars[column - quiet] === '1');
+        expect.textContent = `バーコード確認。読み取った13桁が ${code.digits} とすべて同じなら成功です。一桁でも違えば失敗です。通し番号は${String(count).padStart(4, '0')}です。`;
+        return;
+      }
+      const text = payload(count);
+      const qr = encode(text, { ecc: 'L', border: 2 });
+      canvas.className = 'qr';
+      paintModules(qr.size, qr.size, (column, row) => qr.data[row][column]);
+      expect.textContent = text;
+    }
+
+    function speed() {
+      const shortSide = Math.min(window.innerWidth, window.innerHeight);
+      return shortSide * 0.16 * Number(speedInput.value);
+    }
+
+    function aim() {
+      const angle = Math.random() * Math.PI * 2;
+      const pace = speed();
+      vx = Math.cos(angle) * pace;
+      vy = Math.sin(angle) * pace;
+    }
+
+    function applySpeed() {
+      const pace = speed();
+      const angle = Math.hypot(vx, vy) ? Math.atan2(vy, vx) : 0;
+      vx = Math.cos(angle) * pace;
+      vy = Math.sin(angle) * pace;
+    }
+
+    function place(now) {
+      const dt = Math.min(0.05, last ? (now - last) / 1000 : 0);
+      last = now;
+      const maxX = Math.max(0, window.innerWidth - card.offsetWidth);
+      const maxY = Math.max(0, window.innerHeight - document.querySelector('#panel').offsetHeight - card.offsetHeight);
+      x += vx * dt;
+      y += vy * dt;
+      if (x < 0) { x = 0; vx = Math.abs(vx); }
+      else if (x > maxX) { x = maxX; vx = -Math.abs(vx); }
+      if (y < 0) { y = 0; vy = Math.abs(vy); }
+      else if (y > maxY) { y = maxY; vy = -Math.abs(vy); }
+      card.style.transform = `translate(${x}px, ${y}px)`;
+      requestAnimationFrame(place);
+    }
+
+    count = 1;
+    draw();
+    aim();
+    x = Math.random() * Math.max(0, window.innerWidth - card.offsetWidth);
+    y = Math.random() * Math.max(0, window.innerHeight - document.querySelector('#panel').offsetHeight - card.offsetHeight);
+    speedInput.addEventListener('input', applySpeed);
+    modeButton.addEventListener('click', () => {
+      mode = mode === 'qr' ? 'ean' : 'qr';
+      modeButton.textContent = mode === 'qr' ? 'バーコードに切り替え' : 'QRに切り替え';
+      draw();
+    });
+    setInterval(() => {
+      count += 1;
+      draw();
+      aim();
+    }, 1000);
+    requestAnimationFrame(place);
+  </script>
+</body>
+</html>

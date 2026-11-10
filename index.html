@@ -34,6 +34,7 @@
     </div>
     <output id="result">読み取った内容</output>
     <p id="note"></p>
+    <p><a href="./moving.html">動くコード</a></p>
     <div class="actions">
       <button id="engine" type="button">検出: zxing-wasm</button>
       <button id="toggle" type="button">読み取り開始</button>
@@ -42,8 +43,8 @@
   <script type="module">
     import { prepareZXingModule, readBarcodes } from 'https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.6/dist/es/reader/index.js';
 
-    const labels = { QRCode: 'QR', EAN13: 'EAN-13', EAN8: 'EAN-8', UPCA: 'UPC-A', UPCE: 'UPC-E', Code128: 'Code 128', Code39: 'Code 39', ITF: 'ITF', Codabar: 'Codabar' };
-    const nativeLabels = { qr_code: 'QR', ean_13: 'EAN-13', ean_8: 'EAN-8', upc_a: 'UPC-A', upc_e: 'UPC-E', code_128: 'Code 128', code_39: 'Code 39', itf: 'ITF', codabar: 'Codabar' };
+    const labels = { QRCode: 'QR', EAN13: 'EAN-13' };
+    const nativeLabels = { qr_code: 'QR', ean_13: 'EAN-13' };
     const nativeFormats = Object.keys(nativeLabels);
     const view = document.querySelector('#view');
     const overlay = document.querySelector('#overlay');
@@ -55,7 +56,7 @@
     const capture = document.createElement('canvas');
     const captureContext = capture.getContext('2d', { willReadFrequently: true });
     const readerOptions = {
-      formats: ['QRCode', 'EAN13', 'EAN8', 'UPCA', 'UPCE', 'Code128', 'Code39', 'ITF', 'Codabar'],
+      formats: ['QRCode', 'EAN13'],
       tryHarder: false,
       tryRotate: false,
       tryInvert: false,
@@ -68,12 +69,52 @@
     let session = 0;
     let hits = null;
     let scale = 1;
+    let cropX = 0;
+    let cropY = 0;
+    const engines = ['wasm', 'native', 'rxing'];
+    const engineLabels = {
+      wasm: '検出: zxing-wasm',
+      native: '検出: BarcodeDetector',
+      rxing: '検出: rxing',
+    };
     let engine = 'wasm';
     let detectorPromise = null;
+    let rxingPromise = null;
+    let rxingApi = null;
+    let rxingHints = null;
     const wasmReady = prepareZXingModule({ fireImmediately: true });
 
     function labelEngine() {
-      engineButton.textContent = engine === 'native' ? '検出: BarcodeDetector' : '検出: zxing-wasm';
+      engineButton.textContent = engineLabels[engine];
+    }
+
+    const rxingBase = 'https://cdn.jsdelivr.net/npm/rxing-wasm@0.5.8/';
+
+    function ensureRxing() {
+      if (rxingPromise) return rxingPromise;
+      rxingPromise = (async () => {
+        const api = await import(rxingBase + 'rxing_wasm_bg.js');
+        const response = await fetch(rxingBase + 'rxing_wasm_bg.wasm');
+        if (!response.ok) throw new Error('wasm ' + response.status);
+        const module = await WebAssembly.compile(await response.arrayBuffer());
+        const moduleKey = WebAssembly.Module.imports(module)[0]?.module ?? './rxing_wasm_bg.js';
+        const instance = await WebAssembly.instantiate(module, { [moduleKey]: api });
+        api.__wbg_set_wasm(instance.exports);
+        const hints = new api.DecodeHintDictionary();
+        const formatsSet = hints.set_hint(api.DecodeHintTypes.PossibleFormats, 'qrcode,ean13');
+        const fasterSet = hints.set_hint(api.DecodeHintTypes.TryHarder, 'false');
+        const uprightSet = hints.set_hint(api.DecodeHintTypes.AlsoInverted, 'false');
+        if (!formatsSet || !fasterSet || !uprightSet) throw new Error('rxing hints');
+        rxingApi = api;
+        rxingHints = hints;
+        return api;
+      })().catch((error) => {
+        rxingPromise = null;
+        rxingApi = null;
+        rxingHints = null;
+        throw error;
+      });
+      return rxingPromise;
     }
 
     function ensureDetector() {
@@ -129,6 +170,33 @@
       };
     }
 
+    function scanWindow() {
+      const place = framePlacement();
+      const box = place.box;
+      const margin = Math.min(box.width, box.height) * 0.12;
+      const screen = {
+        x: margin,
+        y: margin,
+        width: Math.max(0, box.width - margin * 2),
+        height: Math.max(0, box.height - margin * 2),
+      };
+      let video = null;
+      if (place.ready && screen.width >= 2 && screen.height >= 2) {
+        const x0 = (screen.x - place.left) / place.cover;
+        const y0 = (screen.y - place.top) / place.cover;
+        const x1 = (screen.x + screen.width - place.left) / place.cover;
+        const y1 = (screen.y + screen.height - place.top) / place.cover;
+        const maxW = view.videoWidth;
+        const maxH = view.videoHeight;
+        const x = Math.max(0, Math.min(maxW - 1, Math.floor(x0)));
+        const y = Math.max(0, Math.min(maxH - 1, Math.floor(y0)));
+        const right = Math.max(x + 1, Math.min(maxW, Math.ceil(x1)));
+        const bottom = Math.max(y + 1, Math.min(maxH, Math.ceil(y1)));
+        video = { x, y, width: right - x, height: bottom - y };
+      }
+      return { place, screen, video };
+    }
+
     function screenPoints(place) {
       return hits.map((point) => [
         place.left + point.x * place.cover,
@@ -137,7 +205,8 @@
     }
 
     function paint() {
-      const place = framePlacement();
+      const finder = scanWindow();
+      const place = finder.place;
       const box = place.box;
       const ratio = window.devicePixelRatio || 1;
       const nextWidth = Math.max(1, Math.round(box.width * ratio));
@@ -150,7 +219,13 @@
       context.fillStyle = '#111';
       context.fillRect(0, 0, box.width, box.height);
       if (place.ready) context.drawImage(view, place.left, place.top, place.width, place.height);
-      const margin = Math.min(box.width, box.height) * 0.12;
+      const screen = finder.screen;
+      context.fillStyle = 'rgba(0, 0, 0, 0.45)';
+      context.fillRect(0, 0, box.width, screen.y);
+      context.fillRect(0, screen.y + screen.height, box.width, box.height - screen.y - screen.height);
+      context.fillRect(0, screen.y, screen.x, screen.height);
+      context.fillRect(screen.x + screen.width, screen.y, box.width - screen.x - screen.width, screen.height);
+      const margin = screen.x;
       const length = margin * 0.7;
       context.strokeStyle = 'rgba(255,255,255,0.85)';
       context.lineWidth = 3;
@@ -179,24 +254,97 @@
     }
 
     function grab() {
-      const sourceWidth = view.videoWidth;
-      const sourceHeight = view.videoHeight;
-      const edge = Math.max(sourceWidth, sourceHeight);
+      const region = scanWindow().video;
+      if (!region) return null;
+      const edge = Math.max(region.width, region.height);
       const factor = edge > decodeLongEdge ? decodeLongEdge / edge : 1;
-      const width = Math.max(1, Math.round(sourceWidth * factor));
-      const height = Math.max(1, Math.round(sourceHeight * factor));
+      const width = Math.max(1, Math.round(region.width * factor));
+      const height = Math.max(1, Math.round(region.height * factor));
       if (capture.width !== width || capture.height !== height) {
         capture.width = width;
         capture.height = height;
       }
-      scale = width / sourceWidth;
-      captureContext.drawImage(view, 0, 0, width, height);
+      scale = width / region.width;
+      cropX = region.x;
+      cropY = region.y;
+      captureContext.drawImage(view, region.x, region.y, region.width, region.height, 0, 0, width, height);
       return captureContext.getImageData(0, 0, width, height);
     }
 
+    function mapToVideo(points) {
+      return points.map((point) => ({ x: cropX + point.x / scale, y: cropY + point.y / scale }));
+    }
+
     function videoPoints(position) {
-      return [position.topLeft, position.topRight, position.bottomRight, position.bottomLeft]
-        .map((point) => ({ x: point.x / scale, y: point.y / scale }));
+      return mapToVideo([position.topLeft, position.topRight, position.bottomRight, position.bottomLeft]);
+    }
+
+    function turn(origin, a, b) {
+      return (a.x - origin.x) * (b.y - origin.y) - (a.y - origin.y) * (b.x - origin.x);
+    }
+
+    function outline(points) {
+      const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
+      if (sorted.length < 3) return sorted;
+      const lower = [];
+      const upper = [];
+      for (const point of sorted) {
+        while (lower.length >= 2 && turn(lower[lower.length - 2], lower[lower.length - 1], point) <= 0) lower.pop();
+        lower.push(point);
+      }
+      for (let index = sorted.length - 1; index >= 0; index -= 1) {
+        const point = sorted[index];
+        while (upper.length >= 2 && turn(upper[upper.length - 2], upper[upper.length - 1], point) <= 0) upper.pop();
+        upper.push(point);
+      }
+      lower.pop();
+      upper.pop();
+      return lower.concat(upper);
+    }
+
+    function shapePoints(pairs) {
+      const points = [];
+      for (let index = 0; index + 1 < pairs.length; index += 2) {
+        points.push({ x: pairs[index], y: pairs[index + 1] });
+      }
+      if (points.length !== 2) return outline(points);
+      const [start, end] = points;
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const length = Math.hypot(dx, dy) || 1;
+      const band = Math.max(8, length * 0.18);
+      const px = (-dy / length) * band;
+      const py = (dx / length) * band;
+      return outline([
+        { x: start.x + px, y: start.y + py },
+        { x: end.x + px, y: end.y + py },
+        { x: end.x - px, y: end.y - py },
+        { x: start.x - px, y: start.y - py },
+      ]);
+    }
+
+    function readRxing(image) {
+      const luma = rxingApi.convert_imagedata_to_luma(image);
+      let hit = null;
+      try {
+        hit = rxingApi.decode_barcode_with_hints(luma, image.width, image.height, rxingHints, false);
+      } catch (error) {
+        if (String(error).includes('not found')) return null;
+        throw error;
+      }
+      try {
+        const text = hit.text();
+        if (!text) return null;
+        const format = hit.format();
+        const name = format === rxingApi.BarcodeFormat.QrCode
+          ? 'QR'
+          : format === rxingApi.BarcodeFormat.Ean13
+            ? 'EAN-13'
+            : String(format);
+        return { points: mapToVideo(shapePoints(hit.result_points())), line: `${name}\n${text}` };
+      } finally {
+        hit.free();
+      }
     }
 
     function halt() {
@@ -220,13 +368,23 @@
           note.textContent = 'このブラウザは BarcodeDetector に対応していません。';
           return null;
         }
-        const codes = await reader.detect(view);
+        const image = grab();
+        if (!image) return null;
+        const codes = await reader.detect(capture);
         const code = codes.find((item) => item.rawValue);
         if (!code) return null;
         const name = nativeLabels[code.format] ?? code.format;
-        return { points: nativePoints(code), line: `${name}\n${code.rawValue}` };
+        return { points: mapToVideo(nativePoints(code)), line: `${name}\n${code.rawValue}` };
       }
-      const found = await readBarcodes(grab(), readerOptions);
+      if (mode === 'rxing') {
+        await ensureRxing();
+        const image = grab();
+        if (!image) return null;
+        return readRxing(image);
+      }
+      const image = grab();
+      if (!image) return null;
+      const found = await readBarcodes(image, readerOptions);
       const hit = found.find((item) => item.isValid && item.text);
       if (!hit) return null;
       const name = labels[hit.format] ?? hit.format;
@@ -272,26 +430,47 @@
     paint();
 
     engineButton.addEventListener('click', async () => {
-      if (engine === 'wasm') {
-        engineButton.disabled = true;
-        try {
-          const reader = await ensureDetector();
-          if (!reader) {
-            note.textContent = 'このブラウザは BarcodeDetector に対応していません。';
-            return;
+      engineButton.disabled = true;
+      const start = engines.indexOf(engine);
+      let skipped = '';
+      let chosen = null;
+      try {
+        for (let step = 1; step <= engines.length; step += 1) {
+          const next = engines[(start + step) % engines.length];
+          if (next === 'native') {
+            try {
+              const reader = await ensureDetector();
+              if (!reader) {
+                skipped = 'このブラウザは BarcodeDetector に対応していません。';
+                continue;
+              }
+            } catch (error) {
+              skipped = 'BarcodeDetector を開始できませんでした。';
+              continue;
+            }
           }
-        } catch (error) {
-          note.textContent = 'BarcodeDetector を開始できませんでした。';
-          return;
-        } finally {
-          engineButton.disabled = false;
+          if (next === 'rxing') {
+            try {
+              await ensureRxing();
+            } catch (error) {
+              skipped = 'rxing を開始できませんでした。';
+              continue;
+            }
+          }
+          chosen = next;
+          break;
         }
-        engine = 'native';
-      } else {
-        engine = 'wasm';
+      } finally {
+        engineButton.disabled = false;
       }
+      if (!chosen) {
+        note.textContent = skipped || '検出を切り替えられませんでした。';
+        return;
+      }
+      const immediate = engines[(start + 1) % engines.length];
+      engine = chosen;
       hits = null;
-      note.textContent = '';
+      note.textContent = chosen === immediate ? '' : skipped;
       labelEngine();
       if (running) paint();
     });
